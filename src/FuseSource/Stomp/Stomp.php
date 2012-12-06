@@ -694,15 +694,15 @@ class Stomp
 
     protected function _preConnect()
     {
-        if ($this->_connectHeaders['accept-version'] && !$this->_connectHeaders['host']) {
+        if (isset($this->_connectHeaders['accept-version']) && !isset($this->_connectHeaders['host'])) {
             throw new ProtocolErrorConnectException();
         }
 
-        if (!$this->_connectHeaders['accept-version'] && $this->_connectHeaders['host']) {
+        if (!isset($this->_connectHeaders['accept-version']) && isset($this->_connectHeaders['host'])) {
             throw new ProtocolErrorConnectException();
         }
 
-        if (!($this->_connectHeaders['accept-version'] && $this->_connectHeaders['host'])) {
+        if (!(isset($this->_connectHeaders['accept-version']) && isset($this->_connectHeaders['host']))) {
             // 1.0
             return;
         }
@@ -712,7 +712,7 @@ class Stomp
         $aVers = explode(',', $this->_connectHeaders['accept-version']);
 
         foreach ($aVers as $nVer) {
-            if (array_key_exists($nVer, static::$supportedVersions)) {
+            if (in_array($nVer, static::$supportedVersions)) {
                 $okVers[] = $nVer;
                 if ($nVer == self::SPL_10) {
                     $this->_has10 = true;
@@ -729,7 +729,7 @@ class Stomp
 
     protected function _postConnect()
     {
-        if (!($this->_connectHeaders['accept-version'] && $this->_connectHeaders['host'])) {
+        if (!(isset($this->_connectHeaders['accept-version']) && isset($this->_connectHeaders['host']))) {
             return;
         }
 
@@ -740,7 +740,7 @@ class Stomp
         $this->_protocol = $this->_connectedFrame->headers['version'];
 
         if ($this->_protocol) {
-            if (!array_key_exists($this->_protocol, static::$supportedVersions)) {
+            if (!in_array($this->_protocol, static::$supportedVersions)) {
                 throw new UnsupportedProtocolException();
             }
         } else {
