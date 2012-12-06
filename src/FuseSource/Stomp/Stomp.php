@@ -3,6 +3,8 @@
 namespace FuseSource\Stomp;
 
 use FuseSource\Stomp\Exception\StompException;
+use FuseSource\Stomp\Exception\ProtocolErrorConnectException;
+use FuseSource\Stomp\Exception\UnsupportedProtocolException;
 use FuseSource\Stomp\Message\Map;
 
 /**
@@ -36,6 +38,15 @@ use FuseSource\Stomp\Message\Map;
  */
 class Stomp
 {
+    /**
+     * Stomp Protocol Versions
+     */
+    const SPL_10 = '1.0';
+    const SPL_11 = '1.1';
+    const SPL_12 = '1.2';
+
+    protected static $supportedVersions = array(self::SPL_10, self::SPL_11);
+
     /**
      * Perform request synchronously
      *
@@ -77,16 +88,23 @@ class Stomp
     protected $_read_timeout_milliseconds = 0;
     protected $_connect_timeout_seconds = 60;
     protected $_waitbuf = array();
+    protected $_connectHeaders = array();
+    protected $_has10;
+    protected $_protocol;
+    protected $_connectedFrame;
 
     /**
      * Constructor
      *
      * @param string $brokerUri Broker URL
+     * @param array $connectHeaders Optional headers for STOMP connection
      * @throws StompException
      */
-    public function __construct ($brokerUri)
+    public function __construct ($brokerUri, $connectHeaders = array())
     {
+        $this->_protocol = self::SPL_10; // Assumed at first
         $this->_brokerUri = $brokerUri;
+        $this->_connectHeaders = $connectHeaders;
         $this->_init();
     }
     /**
@@ -137,7 +155,7 @@ class Stomp
      *
      * @throws StompException
      */
-    protected function _makeConnection ()
+    protected function _openSocket ()
     {
         if (count($this->_hosts) == 0) {
             throw new StompException("No broker defined");
@@ -192,20 +210,22 @@ class Stomp
      */
     public function connect ($username = '', $password = '')
     {
-        $this->_makeConnection();
+        $this->_openSocket();
         if ($username != '') {
             $this->_username = $username;
         }
         if ($password != '') {
             $this->_password = $password;
         }
-		$headers = array('login' => $this->_username , 'passcode' => $this->_password);
+        $headers = array_merge($this->_connectHeaders, array('login' => $this->_username , 'passcode' => $this->_password));
 		if ($this->clientId != null) {
 			$headers["client-id"] = $this->clientId;
 		}
+        $this->_preConnect();
 		$frame = new Frame("CONNECT", $headers);
         $this->_writeFrame($frame);
-        $frame = $this->readFrame();
+        $this->_connectedFrame = $frame = $this->readFrame();
+        $this->_postConnect();
 
         if ($frame instanceof Frame && $frame->command == 'CONNECTED') {
             $this->_sessionId = $frame->headers["session"];
@@ -356,11 +376,17 @@ class Stomp
             }
         }
         $headers['destination'] = $destination;
+        $this->_setSubscriptionIdIfMissing($destination, $headers);
+
+        if (isset($this->_subscriptions[$headers['id']])) {
+            throw new StompException('Attempting to subscribe to a queue with a previous subscription');
+        }
+
         $frame = new Frame('SUBSCRIBE', $headers);
         $this->_prepareReceipt($frame, $sync);
         $this->_writeFrame($frame);
         if ($this->_waitForReceipt($frame, $sync) == true) {
-            $this->_subscriptions[$destination] = $properties;
+            $this->_subscriptions[$headers['id']] = $properties;
             return true;
         } else {
             return false;
@@ -389,6 +415,7 @@ class Stomp
             }
         }
         $headers['destination'] = $destination;
+        $this->_setSubscriptionIdIfMissing($destination, $headers);
         $frame = new Frame('UNSUBSCRIBE', $headers);
         $this->_prepareReceipt($frame, $sync);
         $this->_writeFrame($frame);
@@ -466,7 +493,7 @@ class Stomp
     public function ack ($message, $transactionId = null)
     {
         if ($message instanceof Frame) {
-            $headers = $message->headers;
+            $headers = array_intersect_key($message->headers, array('message-id' => true, 'subscription' => true));
             if (isset($transactionId)) {
                 $headers['transaction'] = $transactionId;
             }
@@ -484,6 +511,35 @@ class Stomp
             }
             $headers['message-id'] = $message;
             $frame = new Frame('ACK', $headers);
+            $this->_writeFrame($frame);
+            return true;
+        }
+    }
+
+    /**
+     * Not-acknowledge (reject) a message
+     *
+     * @param $message
+     * @param null $transactionId
+     * @return bool
+     */
+    public function nack ($message, $transactionId = null)
+    {
+        if ($message instanceof Frame) {
+            $headers = array_intersect_key($message->headers, array('message-id' => true, 'subscription' => true));
+            if (isset($transactionId)) {
+                $headers['transaction'] = $transactionId;
+            }
+            $frame = new Frame('NACK', $headers);
+            $this->_writeFrame($frame);
+            return true;
+        } else {
+            $headers = array();
+            if (isset($transactionId)) {
+                $headers['transaction'] = $transactionId;
+            }
+            $headers['message-id'] = $message;
+            $frame = new Frame('NACK', $headers);
             $this->_writeFrame($frame);
             return true;
         }
@@ -620,6 +676,76 @@ class Stomp
             return true;
         } else {
             return false;
+        }
+    }
+
+    /**
+     * Sets a subscription ID in the headers if it does not exist
+     *
+     * @param $destination
+     * @param $headers
+     */
+    protected function _setSubscriptionIdIfMissing($destination, &$headers)
+    {
+        if (!isset($headers['id']) || is_null($headers['id'])) {
+            $headers['id'] = sha1($destination);
+        }
+    }
+
+    protected function _preConnect()
+    {
+        if ($this->_connectHeaders['accept-version'] && !$this->_connectHeaders['host']) {
+            throw new ProtocolErrorConnectException();
+        }
+
+        if (!$this->_connectHeaders['accept-version'] && $this->_connectHeaders['host']) {
+            throw new ProtocolErrorConnectException();
+        }
+
+        if (!($this->_connectHeaders['accept-version'] && $this->_connectHeaders['host'])) {
+            // 1.0
+            return;
+        }
+
+        $this->_has10 = false;
+        $okVers = array();
+        $aVers = explode(',', $this->_connectHeaders['accept-version']);
+
+        foreach ($aVers as $nVer) {
+            if (array_key_exists($nVer, static::$supportedVersions)) {
+                $okVers[] = $nVer;
+                if ($nVer == self::SPL_10) {
+                    $this->_has10 = true;
+                }
+            }
+        }
+
+        if (empty($okVers)) {
+            throw new UnsupportedProtocolException();
+        }
+
+        $this->_connectHeaders['accept-version'] = implode(',', $okVers);
+    }
+
+    protected function _postConnect()
+    {
+        if (!($this->_connectHeaders['accept-version'] && $this->_connectHeaders['host'])) {
+            return;
+        }
+
+        if ($this->_connectedFrame->command == 'ERROR') {
+            return;
+        }
+
+        $this->_protocol = $this->_connectedFrame->headers['version'];
+
+        if ($this->_protocol) {
+            if (!array_key_exists($this->_protocol, static::$supportedVersions)) {
+                throw new UnsupportedProtocolException();
+            }
+        } else {
+            // CONNECTed to 1.0 server that didn't return *any* 1.1 type headers
+            $this->_protocol = self::SPL_10;
         }
     }
 
