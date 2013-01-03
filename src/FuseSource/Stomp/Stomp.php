@@ -85,7 +85,7 @@ class Stomp
     protected $_password = '';
     protected $_sessionId;
     protected $_read_timeout_seconds = 60;
-    protected $_read_timeout_milliseconds = 0;
+    protected $_read_timeout_microseconds = 0;
     protected $_connect_timeout_seconds = 60;
     protected $_waitbuf = array();
     protected $_connectHeaders = array();
@@ -187,10 +187,12 @@ class Stomp
                 fclose($this->_socket);
                 $this->_socket = null;
             }
-            $this->_socket = @fsockopen($scheme . '://' . $host, $port, $connect_errno, $connect_errstr, $this->_connect_timeout_seconds);
+            $this->_socket = @stream_socket_client($scheme . '://' . $host . ':' . $port, $connect_errno, $connect_errstr, $this->_connect_timeout_seconds);
             if (!is_resource($this->_socket) && $att >= $this->_attempts && !array_key_exists($i + 1, $this->_hosts)) {
                 throw new StompException("Could not connect to $host:$port ($att/{$this->_attempts})");
             } else if (is_resource($this->_socket)) {
+                // Prevent fread() from blocking for obscene periods of time when reading < 1024 bytes in readFrame()
+                stream_set_timeout($this->_socket, 0, 20000);
                 $connected = true;
                 $this->_currentHost = $i;
                 break;
@@ -591,12 +593,12 @@ class Stomp
      * Set timeout to wait for content to read
      *
      * @param int $seconds_to_wait  Seconds to wait for a frame
-     * @param int $milliseconds Milliseconds to wait for a frame
+     * @param int $microseconds Microseconds to wait for a frame
      */
-    public function setReadTimeout($seconds, $milliseconds = 0)
+    public function setReadTimeout($seconds, $microseconds = 0)
     {
         $this->_read_timeout_seconds = $seconds;
-        $this->_read_timeout_milliseconds = $milliseconds;
+        $this->_read_timeout_microseconds = $microseconds;
     }
 
     /**
@@ -645,11 +647,11 @@ class Stomp
             }
         }
         $frame = new Frame($command, $headers, trim($body));
+
         if (isset($frame->headers['transformation']) && $frame->headers['transformation'] == 'jms-map-json') {
             return new Map($frame);
-        } else {
-            return $frame;
         }
+
         return $frame;
     }
 
@@ -664,19 +666,17 @@ class Stomp
         $write = null;
         $except = null;
 
-        $has_frame_to_read = @stream_select($read, $write, $except, $this->_read_timeout_seconds, $this->_read_timeout_milliseconds);
+        $hasFrameToRead = @stream_select($read, $write, $except, $this->_read_timeout_seconds, $this->_read_timeout_microseconds);
 
-        if ($has_frame_to_read !== false)
-            $has_frame_to_read = count($read);
-
-
-        if ($has_frame_to_read === false) {
+        if (false === $hasFrameToRead) {
             throw new StompException('Check failed to determine if the socket is readable');
-        } else if ($has_frame_to_read > 0) {
-            return true;
-        } else {
-            return false;
         }
+
+        if (count($read) > 0) {
+            return true;
+        }
+
+        return false;
     }
 
     /**
